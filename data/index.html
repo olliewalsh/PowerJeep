@@ -554,6 +554,18 @@
           document.getElementById("maxBackwardInputValue").innerHTML =
             json.max_backward;
         }
+        if (json.battery_voltage != undefined) {
+          document.getElementById("batteryVoltage").innerHTML =
+            json.battery_voltage;
+        }
+        if (json.charging) {
+          document.getElementById("chargeVoltage").innerHTML =
+            "CHARGING (" + json.charge_voltage + ")";
+        }
+        else if (json.charge_voltage != undefined) {
+          document.getElementById("chargeVoltage").innerHTML =
+            json.charge_voltage;
+        }
       }
 
       function onError(event) {
@@ -763,6 +775,13 @@
       <button id="stopButton" onclick="return onPressEmergencyStop(this)">
         Emergency Stop</button
       ><br />
+      <hr />
+      <div>Battery Voltage</div>
+      <div id="batteryVoltage"></div>
+      <hr />
+      <hr />
+      <div>Charge Voltage</div>
+      <div id="chargeVoltage"></div>
       <hr />
       <form>
         <div class="slider_container">

@@ -20,41 +20,66 @@ static const char *TAG = "drive";
 static void drive_task(void *pvParameter);
 static void broadcast_speed_task(void *pvParameter);
 static void led_task(void *pvParameter);
+static void battery_mgmt_task(void *pvParameter);
 
 // ADC throttle capability
 
-#define WITH_ADC_THROTTLE 0
+#define WITH_ADC_THROTTLE 1
 
-#if WITH_ADC_THROTTLE
+// Battery voltage monitoring capability
+
+#define WITH_BATTERY_MONITOR 1
+
+// Charge control capability
+
+#define WITH_CHARGE_CONTROL 1
+
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
-#endif
 
 // PIN
 
 // - Inputs
 #if WITH_ADC_THROTTLE
-#define GAS_PEDAL_FORWARD_PIN ADC1_CHANNEL_4 // GPIO 32
+#define GAS_PEDAL_FORWARD_PIN ADC1_CHANNEL_4 // GPIO 32 
 #define GAS_PEDAL_BACKWARD_PIN ADC1_CHANNEL_5 // GPIO 33
 #else
 #define GAS_PEDAL_FORWARD_PIN GPIO_NUM_32
 #define GAS_PEDAL_BACKWARD_PIN GPIO_NUM_33
 #endif
+#define CHARGE_VOLTAGE_PIN ADC1_CHANNEL_0 // GPIO 36 
+#define BATTERY_VOLTAGE_PIN ADC1_CHANNEL_3 // GPIO 39
+#define START_PIN GPIO_NUM_23
 // - Outputs
 #define FORWARD_PWM_PIN GPIO_NUM_18
 #define BACKWARD_PWM_PIN GPIO_NUM_19
+#define FORWARD2_PWM_PIN GPIO_NUM_16
+#define BACKWARD2_PWM_PIN GPIO_NUM_17
 #define STATUS_LED_PIN GPIO_NUM_2
+#define CHARGE_DISABLE_PIN GPIO_NUM_5
+
+#define STATUS_LED_0_PIN GPIO_NUM_13
+#define STATUS_LED_1_PIN GPIO_NUM_12
+#define STATUS_LED_2_PIN GPIO_NUM_14
+#define STATUS_LED_3_PIN GPIO_NUM_27
+#define STATUS_LED_4_PIN GPIO_NUM_26
 
 // Constants
 
-#define FORWARD_SHUTOFF_THRESOLD 15 // %
-#define BACKWARD_SHUTOFF_THRESOLD 10 // %
+#define FORWARD_SHUTOFF_THRESOLD 7.5 // %
+#define BACKWARD_SHUTOFF_THRESOLD 5 // %
 
-// - With a 18v battery, 66% is equivalent to a 12v
-#define DEFAULT_FORWARD_MAX_SPEED 60 // %
+// - With a 24v battery, 50% is equivalent to a 12v
+#define DEFAULT_FORWARD_MAX_SPEED 50 // %
 #define DEFAULT_BACKWARD_MAX_SPEED 35 // %
 
-#define SPEED_INCREMENT 0.5f // % of increment per loop
+#define DEFAULT_MAX_BATTERY 28.0
+#define DEFAULT_MIN_BATTERY 23.0
+#define DEFAULT_MAX_CHARGE 29.5
+#define VOLTAGE_R1 99000
+#define VOLTAGE_R2 10000
+
+#define SPEED_INCREMENT 0.25f // % of increment per loop
 
 #define MOTOR_PWM_CHANNEL_FORWARD LEDC_CHANNEL_1
 #define MOTOR_PWM_CHANNEL_BACKWARD LEDC_CHANNEL_2
@@ -69,12 +94,18 @@ float max_forward = 0;
 float max_backward = 0;
 int led_sleep_delay = 20;
 
-#if WITH_ADC_THROTTLE
+float max_battery = 0;
+float min_battery = 0;
+float max_charge = 0; // Don't charge if above this
+
+bool is_charging = false;
+bool charging_pause = false;
+float battery_voltage = 0;
+float charge_voltage = 0;
+bool battery_empty = false;
+
 static esp_adc_cal_characteristics_t adc1_chars;
 bool adc_calibration_enabled = false;
-uint32_t adc_average = 0;
-uint32_t adc_voltage = 0;
-#endif
 
 // ***************
 // **** WEBSOCKETS
@@ -89,8 +120,24 @@ uint32_t adc_voltage = 0;
 //}
 void broadcast_all_values() {
   char *message;
-  char *format = "{\"current_speed\":%f,\"max_forward\":%f,\"max_backward\":%f,\"emergency_stop\":%s}";
-  asprintf(&message, format, current_speed, max_forward, max_backward, emergency_stop ? "true" : "false");
+  char *format = "{"
+    "\"current_speed\":%f,\"max_forward\":%f,\"max_backward\":%f,\"emergency_stop\":%s"
+#if WITH_BATTERY_MONITOR
+    ",\"battery_voltage\":%f"
+#if WITH_CHARGE_CONTROL
+    ",\"charge_voltage\":%f,\"charging\":%s"
+#endif
+#endif
+  "}";
+  asprintf(&message, format, current_speed, max_forward, max_backward, emergency_stop ? "true" : "false"
+#if WITH_BATTERY_MONITOR
+    ,battery_voltage
+#if WITH_CHARGE_CONTROL
+    ,charge_voltage
+    ,is_charging ? "true" : "false"
+#endif
+#endif
+  );
   ESP_LOGI(TAG, "Send %s", message);
   broadcast_message(message);
   free(message);
@@ -102,7 +149,17 @@ void broadcast_all_values() {
 // }
 void broadcast_current_speed() {
   char *message;
-  asprintf(&message, "{\"current_speed\":%f}", current_speed);
+  char *format = "{"
+    "\"current_speed\":%f"
+#if WITH_BATTERY_MONITOR
+    ",\"battery_voltage\":%f"
+#endif
+  "}";
+  asprintf(&message, format, current_speed
+#if WITH_BATTERY_MONITOR
+    ,battery_voltage
+#endif
+  );
   ESP_LOGI(TAG, "Send %s", message);
   broadcast_message(message);
   free(message);
@@ -191,9 +248,9 @@ static bool adc_calibration_init(void) {
 
 // Setup pin on the board
 void setup_pin() {
-  #if WITH_ADC_THROTTLE
   adc_calibration_enabled = adc_calibration_init();
   ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_DEFAULT));
+  #if WITH_ADC_THROTTLE
   ESP_ERROR_CHECK(adc1_config_channel_atten(GAS_PEDAL_FORWARD_PIN, ADC_ATTEN_DB_11));
   ESP_ERROR_CHECK(adc1_config_channel_atten(GAS_PEDAL_BACKWARD_PIN, ADC_ATTEN_DB_11));
   #else
@@ -206,14 +263,50 @@ void setup_pin() {
   gpio_pullup_en(GAS_PEDAL_BACKWARD_PIN);
   #endif
 
+  #if WITH_BATTERY_MONITOR
+  ESP_ERROR_CHECK(adc1_config_channel_atten(BATTERY_VOLTAGE_PIN, ADC_ATTEN_DB_11));
+  #if WITH_CHARGE_CONTROL
+  ESP_ERROR_CHECK(adc1_config_channel_atten(CHARGE_VOLTAGE_PIN, ADC_ATTEN_DB_11));
+  gpio_reset_pin(CHARGE_DISABLE_PIN);
+  gpio_set_direction(CHARGE_DISABLE_PIN, GPIO_MODE_OUTPUT);
+  gpio_set_level(CHARGE_DISABLE_PIN, 1);
+  #endif
+  #endif
+
   gpio_reset_pin(FORWARD_PWM_PIN);
   gpio_set_direction(FORWARD_PWM_PIN, GPIO_MODE_OUTPUT);
 
   gpio_reset_pin(BACKWARD_PWM_PIN);
   gpio_set_direction(BACKWARD_PWM_PIN, GPIO_MODE_OUTPUT);
 
-  gpio_reset_pin(STATUS_LED_PIN);  
+  gpio_reset_pin(FORWARD2_PWM_PIN);
+  gpio_set_direction(FORWARD2_PWM_PIN, GPIO_MODE_OUTPUT);
+
+  gpio_reset_pin(BACKWARD2_PWM_PIN);
+  gpio_set_direction(BACKWARD2_PWM_PIN, GPIO_MODE_OUTPUT);
+
+  gpio_reset_pin(STATUS_LED_PIN);
   gpio_set_direction(STATUS_LED_PIN, GPIO_MODE_OUTPUT);
+
+  gpio_reset_pin(STATUS_LED_0_PIN);
+  gpio_set_direction(STATUS_LED_0_PIN, GPIO_MODE_OUTPUT);
+  gpio_pulldown_en(STATUS_LED_0_PIN);
+
+  gpio_reset_pin(STATUS_LED_1_PIN);  
+  gpio_set_direction(STATUS_LED_1_PIN, GPIO_MODE_OUTPUT);
+  gpio_pulldown_en(STATUS_LED_1_PIN);
+
+  gpio_reset_pin(STATUS_LED_2_PIN);  
+  gpio_set_direction(STATUS_LED_2_PIN, GPIO_MODE_OUTPUT);
+  gpio_pulldown_en(STATUS_LED_2_PIN);
+
+  gpio_reset_pin(STATUS_LED_3_PIN);  
+  gpio_set_direction(STATUS_LED_3_PIN, GPIO_MODE_OUTPUT);
+  gpio_pulldown_en(STATUS_LED_3_PIN);
+
+  gpio_reset_pin(STATUS_LED_4_PIN);  
+  gpio_set_direction(STATUS_LED_4_PIN, GPIO_MODE_OUTPUT);
+  gpio_pulldown_en(STATUS_LED_4_PIN);
 }
 
 // Setup LED channel to be used to generate PWM
@@ -234,14 +327,32 @@ void setup_pwm() {
   ledc_channel_backward.timer_sel = MOTOR_PWM_TIMER;
   ledc_channel_backward.duty = 0;
 
+  ledc_channel_config_t ledc_channel_forward2 = {0}, ledc_channel_backward2 = {0};
+
+  ledc_channel_forward2.gpio_num = FORWARD2_PWM_PIN;
+  ledc_channel_forward2.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_channel_forward2.channel = MOTOR_PWM_CHANNEL_FORWARD;
+  ledc_channel_forward2.intr_type = LEDC_INTR_DISABLE;
+  ledc_channel_forward2.timer_sel = MOTOR_PWM_TIMER;
+  ledc_channel_forward2.duty = 0;
+
+  ledc_channel_backward2.gpio_num = BACKWARD2_PWM_PIN;
+  ledc_channel_backward2.speed_mode = LEDC_HIGH_SPEED_MODE;
+  ledc_channel_backward2.channel = MOTOR_PWM_CHANNEL_BACKWARD;
+  ledc_channel_backward2.intr_type = LEDC_INTR_DISABLE;
+  ledc_channel_backward2.timer_sel = MOTOR_PWM_TIMER;
+  ledc_channel_backward2.duty = 0;
+
   ledc_timer_config_t ledc_timer = {0};
   ledc_timer.speed_mode = LEDC_HIGH_SPEED_MODE;
   ledc_timer.duty_resolution = MOTOR_PWM_DUTY_RESOLUTION;
   ledc_timer.timer_num = MOTOR_PWM_TIMER;
-  ledc_timer.freq_hz = 25000;
+  ledc_timer.freq_hz = 2500;
 
   ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_forward));
 	ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_backward));
+  ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_forward2));
+	ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_backward2));
 	ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
 }
 
@@ -249,6 +360,13 @@ void setup_driving(void) {
   // Retrieve max values from storage
   readFloat("max_forward", &max_forward, DEFAULT_FORWARD_MAX_SPEED);
   readFloat("max_backward", &max_backward, DEFAULT_BACKWARD_MAX_SPEED);
+  #if WITH_BATTERY_MONITOR
+  readFloat("max_battery", &max_battery, DEFAULT_MAX_BATTERY);
+  readFloat("min_battery", &min_battery, DEFAULT_MIN_BATTERY);
+  #if WITH_CHARGE_CONTROL
+  readFloat("max_charge", &max_charge, DEFAULT_MAX_CHARGE);
+  #endif
+  #endif
 
   // Setup pins
   setup_pin();
@@ -267,6 +385,9 @@ void setup_driving(void) {
 
   // Create a task for the led
   xTaskCreate(&led_task, "led_task", 2048, NULL, 10, NULL);
+
+  // Create a task for the battery status LEDs
+  xTaskCreate(&battery_mgmt_task, "battery_mgmt_task", 2048, NULL, 10, NULL);
 }
 
 // **********
@@ -317,7 +438,8 @@ int get_speed_target(uint8_t forward_position, uint8_t backward_position) {
 
 uint8_t get_throttle_position(uint8_t gpio) {
   #if WITH_ADC_THROTTLE
-  adc_average = 0;
+  uint32_t adc_average = 0;
+  uint32_t adc_voltage = 0;
 
   for (int i = 0; i < 5; ++i) {
     esp_adc_cal_get_voltage(gpio, &adc1_chars, &adc_voltage);
@@ -356,8 +478,8 @@ float compute_next_speed(float current, float target, float delta) {
       // Between 0 < current < FORWARD_SHUTOFF_THRESOLD, we set the car to FORWARD_SHUTOFF_THRESOLD
       return FORWARD_SHUTOFF_THRESOLD;
     } else if (current < 0) {
-      // Slow down more aggressively if the car is moving quicker than 50%
-      float slowdown_rate = current > 50 ? 0.08 : 0.04;
+      // Slow down more aggressively if the car is moving quicker than 25%
+      float slowdown_rate = current > 25 ? 0.08 : 0.04;
       // Safety! Slowing down backward, we must stop the car within a time frame
       return current + delta * slowdown_rate;
     } else {
@@ -377,8 +499,8 @@ float compute_next_speed(float current, float target, float delta) {
       // Between -BACKWARD_SHUTOFF_THRESOLD < current < 0, we set the car to -BACKWARD_SHUTOFF_THRESOLD
       return -BACKWARD_SHUTOFF_THRESOLD;
     } else if (current > 0) {
-      // Slow down more aggressively if the car is moving quicker than 50%
-      float slowdown_rate = current > 50 ? 0.08 : 0.04;
+      // Slow down more aggressively if the car is moving quicker than 25%
+      float slowdown_rate = current > 25 ? 0.08 : 0.04;
       // Safety! Slowing down forward, we must stop the car within a time frame
       return current - delta * slowdown_rate;
     } else {
@@ -392,6 +514,21 @@ float compute_next_speed(float current, float target, float delta) {
 
   return current;
 }
+
+float get_voltage(uint8_t gpio) {
+  double_t adc_average = 0.0;
+  uint32_t adc_voltage = 0;
+
+  for (int i = 0; i < 5; ++i) {
+    esp_adc_cal_get_voltage(gpio, &adc1_chars, &adc_voltage);
+    adc_average += adc_voltage/1000.0;
+  }
+
+  adc_average = adc_average / 5.0;
+
+  return adc_average * (VOLTAGE_R1+VOLTAGE_R2)/VOLTAGE_R2;
+}
+
 
 // **********
 // **** TASKS
@@ -443,6 +580,10 @@ static void drive_task(void *pvParameter) {
 
     // Update targeted speed accordingly
     target = get_speed_target(forward_position, backward_position);
+    #if WITH_BATTERY_MONITOR
+    if (battery_empty) target = 0;
+    #endif
+    if (is_charging || charging_pause) target = 0;
 
     // Take into account a loop could take more than expected
     // This is used to slow down within a fixed timeframe, regardless of the loop duration
@@ -470,5 +611,87 @@ static void led_task(void *pvParameter) {
     vTaskDelay(led_sleep_delay / portTICK_PERIOD_MS);
     gpio_set_level(STATUS_LED_PIN, 1);
     vTaskDelay(led_sleep_delay / portTICK_PERIOD_MS);
+  }
+}
+
+static void battery_mgmt_task(void *pvParameter) {
+  int i = 0;
+  int j = 0;
+  while (true) {
+    battery_voltage = get_voltage(BATTERY_VOLTAGE_PIN);
+
+    float battery_pct = 100.0 * (battery_voltage-DEFAULT_MIN_BATTERY)/(DEFAULT_MAX_BATTERY-DEFAULT_MIN_BATTERY);
+
+    j = (j + 1) % 600;
+    if(is_charging) {
+      if(j%100 == 0){
+        broadcast_all_values();
+      }
+      if(battery_pct >= 100) {
+        gpio_set_level(CHARGE_DISABLE_PIN, 1);
+        is_charging = false;
+        charging_pause = true;
+      }
+      else if(charging_pause && battery_pct < 95) {
+        charging_pause = false;
+        is_charging = true;
+        gpio_set_level(CHARGE_DISABLE_PIN, 0);
+      }
+      if(j == 0) {
+        gpio_set_level(CHARGE_DISABLE_PIN, 1);
+      }
+      if(j == 5) {
+        charge_voltage = get_voltage(CHARGE_VOLTAGE_PIN);
+        if(charge_voltage > DEFAULT_MIN_BATTERY && charge_voltage < battery_voltage){
+          is_charging = false;
+          charging_pause = false;
+        } else {
+          gpio_set_level(CHARGE_DISABLE_PIN, 0);
+        }
+      }
+    } else {
+      charge_voltage = get_voltage(CHARGE_VOLTAGE_PIN);
+      if(charge_voltage > DEFAULT_MIN_BATTERY && charge_voltage > battery_voltage) {
+        gpio_set_level(CHARGE_DISABLE_PIN, 0);
+        is_charging = true;
+        charging_pause = false;
+      }
+    }
+
+    // Update battery status LEDs
+    gpio_set_level(STATUS_LED_0_PIN, 1);
+    gpio_set_level(STATUS_LED_1_PIN, 1);
+    gpio_set_level(STATUS_LED_2_PIN, 1);
+    gpio_set_level(STATUS_LED_3_PIN, 1);
+    gpio_set_level(STATUS_LED_4_PIN, 1);
+
+    i = (i + 1) % 10;
+    // Flash LED if battery empty
+    if(battery_pct <= 0) {
+      // Stop moving if battery empty and not moving
+      if(current_speed == 0) {
+        emergency_stop = true;
+      }
+      if(i <= 4) {
+        gpio_set_level(STATUS_LED_0_PIN, 0);
+        gpio_set_level(STATUS_LED_1_PIN, 0);
+        gpio_set_level(STATUS_LED_2_PIN, 0);
+        gpio_set_level(STATUS_LED_3_PIN, 0);
+        gpio_set_level(STATUS_LED_4_PIN, 0);
+      }
+    } else if (!emergency_stop || i <= 4) {
+      if(battery_pct > 0)
+          gpio_set_level(STATUS_LED_0_PIN, 0);
+      if(battery_pct > 20)
+          gpio_set_level(STATUS_LED_1_PIN, 0);
+      if(battery_pct > 40)
+          gpio_set_level(STATUS_LED_2_PIN, 0);
+      if(battery_pct > 60)
+          gpio_set_level(STATUS_LED_3_PIN, 0);
+      if(battery_pct > 80)
+          gpio_set_level(STATUS_LED_4_PIN, 0);
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
